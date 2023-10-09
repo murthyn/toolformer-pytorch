@@ -223,6 +223,7 @@ def invoke_tools_on_batch_sequences(
 @torch.no_grad()
 def sample(
     model: nn.Module,
+    tokenizer: Callable,
     *,
     seq_len,
     prime: Optional[torch.Tensor] = None,
@@ -254,6 +255,8 @@ def sample(
         prime = torch.full((batch_size, 1), sos_token_id, device = device, dtype = torch.long)
 
     prime = prime.to(device)
+    print("Prime:", tokenizer.decode(prime[0]))
+    import ipdb; ipdb.set_trace()
 
     # sampling positions - different sequences have different cursors
 
@@ -290,21 +293,22 @@ def sample(
     # start iterating
 
     for iteration in tqdm(range(remain_iterations)):
-        logits = model(output)
+        print("Decoding:", tokenizer.decode(output))
+        logits = model(output).logits
         last_logits = logits[batch_indices, position_indices]
 
         # this will ensure that each batch token sequence will have at most one <api> token
 
-        if call_api_only_once:
-            if not exists(api_token_mask):
-                num_tokens = last_logits.shape[-1]
-                api_token_mask = create_api_token_mask(num_tokens, api_start_token_id)
-                api_token_mask = api_token_mask.to(device)
+        # if call_api_only_once:
+            # if not exists(api_token_mask):
+                # num_tokens = last_logits.shape[-1]
+                # api_token_mask = create_api_token_mask(num_tokens, api_start_token_id)
+                # api_token_mask = api_token_mask.to(device)
 
-            api_called = (output == api_start_token_id).any(dim = -1)
+            # api_called = (output == api_start_token_id).any(dim = -1)
 
-            logit_mask = api_token_mask & rearrange(api_called, 'b -> b 1 1')
-            last_logits = last_logits.masked_fill(logit_mask, -torch.finfo(last_logits.dtype).max)
+            # logit_mask = api_token_mask & rearrange(api_called, 'b -> b 1 1')
+            # last_logits = last_logits.masked_fill(logit_mask, -torch.finfo(last_logits.dtype).max)
 
         # greedy sample (but could be made non-greedy)
 
@@ -315,15 +319,16 @@ def sample(
         # seems to be an important hack in the paper
         # it seems like this paper will take a lot more follow up research to be viable
 
-        if auto_select_api_start_token_when_topk:
-            top_token_ids = last_logits.topk(select_api_start_id_top_k, dim = -1).indices
-            has_api_token_in_topk = (top_token_ids == api_start_token_id).any(dim = -1)
-            should_auto_select_api_token = has_api_token_in_topk & ~rearrange(api_called, 'b -> b 1')
+        # if auto_select_api_start_token_when_topk:
+            # top_token_ids = last_logits.topk(select_api_start_id_top_k, dim = -1).indices
+            # has_api_token_in_topk = (top_token_ids == api_start_token_id).any(dim = -1)
+            # should_auto_select_api_token = has_api_token_in_topk & ~rearrange(api_called, 'b -> b 1')
 
-            sampled = sampled.masked_fill(should_auto_select_api_token, api_start_token_id)
+            # sampled = sampled.masked_fill(should_auto_select_api_token, api_start_token_id)
 
         # set the sampled tokens at the right curosr positions
 
+        import ipdb; ipdb.set_trace()
         output[batch_indices, position_indices] = sampled
 
         # increment positions
@@ -542,12 +547,14 @@ class PromptDataset(Dataset):
         prompt: str,
         prompt_input_tag: str,
         data: List[str],
-        tokenizer_encode: Callable
+        tokenizer_encode: Callable,
+        tokenizer_decode: Callable
     ):
         self.data = data
         self.prompt = prompt
         self.prompt_input_tag_regex = re.escape(prompt_input_tag)
         self.tokenizer_encode = tokenizer_encode
+        self.tokenizer_decode = tokenizer_decode
 
     def __len__(self):
         return len(self.data)
@@ -556,9 +563,12 @@ class PromptDataset(Dataset):
         data_string = self.data[idx]
         data_with_prompt = re.sub(self.prompt_input_tag_regex, data_string, self.prompt)
         token_ids = self.tokenizer_encode(data_with_prompt)
+        print("Token IDs:", token_ids)
+        print("Decoded token IDs:", self.tokenizer_decode(token_ids))
         return torch.tensor(token_ids).long(), torch.tensor(len(token_ids)).long()
 
 def prompt_collate_fn(data, padding_value = 0):
+    import ipdb; ipdb.set_trace()
     prompts, prompt_lengths = zip(*data)
     prompts = pad_sequence(prompts, padding_value = padding_value)
     return prompts, torch.stack(prompt_lengths)
@@ -593,7 +603,7 @@ class Toolformer(nn.Module):
         *,
         tool_id: str,
         tool: Callable,
-        api_start_str = ' [',
+        api_start_str = '[',
         api_stop_str = ']',
         api_response_delimiter = '→',
         api_start_id = None,
@@ -603,8 +613,9 @@ class Toolformer(nn.Module):
         pad_id = 0,
         prompt_batch_size = 4,
         model_seq_len = 2048,
-        tokenizer_encode: Callable = tokenizer.encode,
-        tokenizer_decode: Callable = tokenizer.decode,
+        tokenizer: Callable = tokenizer,
+        # tokenizer_encode: Callable = tokenizer.encode,
+        # tokenizer_decode: Callable = tokenizer.decode,
         post_prompt_callback: Callable = identity,
         prompt_input_tag: str = DEFAULT_PROMPT_INPUT_TAG,
         exclude_filters: dict[str, Callable[[str], bool]] = dict(),
@@ -626,8 +637,9 @@ class Toolformer(nn.Module):
 
         self.post_prompt_callback = post_prompt_callback # for easy mocking
 
-        self.tokenizer_encode = tokenizer_encode
-        self.tokenizer_decode = tokenizer_decode
+        self.tokenizer = tokenizer
+        self.tokenizer_encode = self.tokenizer.encode
+        self.tokenizer_decode = self.tokenizer.decode
         self.tokenizer_encode_to_tensor = lambda s: torch.tensor(tokenizer_encode(s)).long()
 
         self.filter_threshold = filter_threshold
@@ -637,16 +649,14 @@ class Toolformer(nn.Module):
         self.api_response_delimiter = api_response_delimiter
 
         if not exists(api_start_id):
-            api_start_id = tokenizer_encode(api_start_str)
-            assert len(api_start_id) == 1
-            api_start_id = api_start_id[0]
+            api_start_id = tokenizer.convert_tokens_to_ids(api_start_str)
+            assert isinstance(api_start_id, int) 
 
         self.api_start_id = api_start_id
 
         if not exists(api_stop_id):
-            api_stop_id = tokenizer_encode(api_stop_str)
-            assert len(api_stop_id) == 1
-            api_stop_id = api_stop_id[0]
+            api_stop_id = tokenizer.convert_tokens_to_ids(api_stop_str)
+            assert isinstance(api_stop_id, int) 
 
         self.api_stop_id = api_stop_id
 
@@ -687,7 +697,8 @@ class Toolformer(nn.Module):
             data = data,
             prompt_input_tag = self.prompt_input_tag,
             prompt = self.teach_tool_prompt,
-            tokenizer_encode = self.tokenizer_encode
+            tokenizer_encode = self.tokenizer_encode,
+            tokenizer_decode = self.tokenizer_decode
         )
 
         dl = PromptDataloader(
@@ -698,14 +709,17 @@ class Toolformer(nn.Module):
         prompted_outputs = []
 
         for prime, positions in dl:
-
             sampled_outputs = sample(
                 model = self.model,
+                tokenizer = self.tokenizer,
                 prime = prime,
                 positions = positions,
                 seq_len = self.model_seq_len,
                 pad_id = self.pad_id,
-                temperature = temperature
+                temperature = temperature,
+                api_start_token_id=self.api_start_id,
+                call_api_only_once=True,
+                auto_select_api_start_token_when_topk=True,
             )
 
             for sample_output, position in zip(sampled_outputs, positions):
